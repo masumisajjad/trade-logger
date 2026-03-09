@@ -21,7 +21,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 
 from models import SignalIn, EntryIn, ExitIn, HealthOut, StatsOut, TradeOut, DailyOut
 
@@ -301,6 +301,201 @@ def daily(days: int = 30):
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    """
+    Quick HTML P&L dashboard. No auth needed (localhost only).
+
+    Why HTML and not JSON: Saj wants a glanceable view in a browser tab.
+    The /stats and /daily endpoints already serve the JSON — this wraps it
+    in something human-readable without needing a full frontend.
+    """
+    try:
+        s = stats()
+        daily_data = daily(days=14)
+        # Fetch signal data directly (avoid FastAPI Query wrapper issue when calling internally)
+        if _use_supabase:
+            from supabase_db import get_supabase
+            signal_data = get_supabase().table('signals').select('*').order('ts', desc=True).execute().data or []
+        else:
+            from database import get_conn
+            conn = get_conn()
+            signal_data = [dict(r) for r in conn.execute('SELECT * FROM signals ORDER BY ts DESC').fetchall()]
+            conn.close()
+        # signals() returns a list from Supabase or SQLite
+        if isinstance(signal_data, list):
+            sig_total = len(signal_data)
+            sig_traded = sum(1 for x in signal_data if x.get('traded'))
+            sig_proposed = sum(1 for x in signal_data if x.get('proposed'))
+            # group by source
+            sources: dict = {}
+            for x in signal_data:
+                src = x.get('source', 'unknown')
+                sources[src] = sources.get(src, 0) + 1
+        else:
+            sig_total = sig_traded = sig_proposed = 0
+            sources = {}
+
+        if isinstance(s, dict):
+            total_pnl = s.get('total_pnl', 0)
+            win_rate = s.get('win_rate', 0)
+            total_trades = s.get('total_trades', 0)
+            avg_pnl = s.get('avg_pnl', 0)
+            best_trade = s.get('best_trade', 0)
+            worst_trade = s.get('worst_trade', 0)
+            by_ticker = s.get('by_ticker', {})
+        else:
+            total_pnl = getattr(s, 'total_pnl', 0)
+            win_rate = getattr(s, 'win_rate', 0)
+            total_trades = getattr(s, 'total_trades', 0)
+            avg_pnl = getattr(s, 'avg_pnl', 0)
+            best_trade = getattr(s, 'best_trade', 0)
+            worst_trade = getattr(s, 'worst_trade', 0)
+            by_ticker = getattr(s, 'by_ticker', {})
+
+        # P&L color
+        pnl_color = '#00d26a' if total_pnl >= 0 else '#ff4444'
+
+        # Daily rows HTML
+        daily_rows = ''
+        for d in (daily_data if isinstance(daily_data, list) else []):
+            date_str = d.get('date', '')
+            dpnl = d.get('pnl', 0) or 0
+            dpnl_color = '#00d26a' if dpnl >= 0 else '#ff4444'
+            wins = d.get('wins', 0)
+            losses = d.get('losses', 0)
+            trades = d.get('trades', 0)
+            wr = round(wins / trades * 100, 1) if trades > 0 else 0
+            daily_rows += f"""
+            <tr>
+                <td>{date_str}</td>
+                <td>{trades}</td>
+                <td>{wins}W / {losses}L</td>
+                <td>{wr:.1f}%</td>
+                <td style="color:{dpnl_color};font-weight:600">${dpnl:+.2f}</td>
+            </tr>"""
+
+        # Ticker breakdown rows
+        ticker_rows = ''
+        if isinstance(by_ticker, dict):
+            for ticker_name, td in sorted(by_ticker.items(), key=lambda x: -x[1].get('pnl', 0)):
+                td_pnl = td.get('pnl', 0)
+                td_color = '#00d26a' if td_pnl >= 0 else '#ff4444'
+                ticker_rows += f"""
+                <tr>
+                    <td><strong>{ticker_name}</strong></td>
+                    <td>{td.get('trades', 0)}</td>
+                    <td>{td.get('wins', 0)}</td>
+                    <td>{td.get('win_rate', 0):.1f}%</td>
+                    <td style="color:{td_color}">${td_pnl:+.2f}</td>
+                </tr>"""
+
+        # Signal source breakdown
+        source_rows = ''
+        for src, count in sources.items():
+            source_rows += f"<tr><td>{src}</td><td>{count}</td></tr>"
+
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trade Logger Dashboard</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: #0f0f13; color: #e8e8e8; margin: 0; padding: 20px; }}
+  h1 {{ font-size: 1.4rem; font-weight: 700; margin: 0 0 4px; }}
+  .subtitle {{ color: #888; font-size: 0.85rem; margin-bottom: 24px; }}
+  .cards {{ display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 28px; }}
+  .card {{ background: #1a1a24; border: 1px solid #2a2a3a; border-radius: 10px;
+           padding: 16px 20px; min-width: 140px; flex: 1; }}
+  .card-label {{ font-size: 0.72rem; color: #888; text-transform: uppercase;
+                 letter-spacing: 0.05em; margin-bottom: 6px; }}
+  .card-value {{ font-size: 1.6rem; font-weight: 700; }}
+  h2 {{ font-size: 1rem; font-weight: 600; color: #aaa; margin: 20px 0 10px; text-transform: uppercase;
+        letter-spacing: 0.05em; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 0.875rem; margin-bottom: 28px; }}
+  th {{ text-align: left; color: #888; font-weight: 500; padding: 8px 10px;
+        border-bottom: 1px solid #2a2a3a; font-size: 0.75rem; text-transform: uppercase; }}
+  td {{ padding: 8px 10px; border-bottom: 1px solid #1e1e2a; }}
+  tr:hover td {{ background: #1e1e2a; }}
+  .badge {{ background: #2a2a3a; border-radius: 4px; padding: 2px 8px; font-size: 0.75rem; }}
+  .ts {{ color: #555; font-size: 0.75rem; margin-top: 16px; }}
+</style>
+</head>
+<body>
+<h1>📊 Trade Logger</h1>
+<p class="subtitle">Central trade analytics — all brokers, all signals · <a href="/docs" style="color:#6b8cff">API Docs</a></p>
+
+<div class="cards">
+  <div class="card">
+    <div class="card-label">Total P&L</div>
+    <div class="card-value" style="color:{pnl_color}">${total_pnl:+.2f}</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Win Rate</div>
+    <div class="card-value">{win_rate:.1f}%</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Total Trades</div>
+    <div class="card-value">{total_trades}</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Avg P&L</div>
+    <div class="card-value" style="color:{'#00d26a' if avg_pnl >= 0 else '#ff4444'}">${avg_pnl:+.2f}</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Best Trade</div>
+    <div class="card-value" style="color:#00d26a">${best_trade:+.2f}</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Worst Trade</div>
+    <div class="card-value" style="color:#ff4444">${worst_trade:+.2f}</div>
+  </div>
+</div>
+
+<h2>Signal Intelligence</h2>
+<div class="cards">
+  <div class="card">
+    <div class="card-label">Total Signals</div>
+    <div class="card-value">{sig_total}</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Proposed</div>
+    <div class="card-value">{sig_proposed}</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Traded</div>
+    <div class="card-value">{sig_traded}</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Signal→Trade Rate</div>
+    <div class="card-value">{'N/A' if sig_total == 0 else f"{sig_traded/sig_total*100:.1f}%"}</div>
+  </div>
+</div>
+
+{'<h2>Signal Sources</h2><table><thead><tr><th>Source</th><th>Signals</th></tr></thead><tbody>' + source_rows + '</tbody></table>' if source_rows else ''}
+
+<h2>By Ticker</h2>
+<table>
+  <thead><tr><th>Ticker</th><th>Trades</th><th>Wins</th><th>Win Rate</th><th>P&L</th></tr></thead>
+  <tbody>{ticker_rows if ticker_rows else '<tr><td colspan="5" style="color:#555">No trades yet</td></tr>'}</tbody>
+</table>
+
+<h2>Daily Summary (Last 14 Days)</h2>
+<table>
+  <thead><tr><th>Date</th><th>Trades</th><th>W/L</th><th>Win Rate</th><th>P&L</th></tr></thead>
+  <tbody>{daily_rows if daily_rows else '<tr><td colspan="5" style="color:#555">No data yet</td></tr>'}</tbody>
+</table>
+
+<p class="ts">Updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')} · Backend: {'Supabase' if _use_supabase else 'SQLite'}</p>
+</body></html>"""
+        return HTMLResponse(content=html)
+    except Exception as e:
+        logger.exception('Dashboard error')
+        return HTMLResponse(content=f'<h1>Error</h1><pre>{e}</pre>', status_code=500)
 
 
 if __name__ == '__main__':
